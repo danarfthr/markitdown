@@ -1,10 +1,27 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import Markdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import dynamic from "next/dynamic";
 
 import { SectionLabel } from "@/components/section-label";
+
+/*
+ * The Markdown parser is ~144 KB and is not needed until a file has converted,
+ * so it is split out of the initial bundle. `ssr: false` is allowed here
+ * because this is already a client component; the same call in a server
+ * component would error.
+ *
+ * The loader is hoisted so convert() can warm the same chunk (see below).
+ */
+const loadMarkdownPreview = () =>
+  import("@/components/markdown-preview").then((m) => m.MarkdownPreview);
+
+const MarkdownPreview = dynamic(loadMarkdownPreview, {
+  ssr: false,
+  // Safety net for a cold cache. convert() normally warms the chunk while the
+  // upload is in flight, so this is rarely seen.
+  loading: () => <p className="text-body-sm text-mercury">Rendering…</p>,
+});
 
 /*
  * Vercel caps both request AND response bodies at 4.5 MB
@@ -67,6 +84,12 @@ export function FileConverter() {
     }
 
     setStatus({ kind: "converting", filename: file.name });
+
+    // Warm the parser chunk while the upload is in flight so it is ready by
+    // the time there is Markdown to render. Deliberately not awaited: the
+    // fetch below must not wait on it, and a failure here is harmless — the
+    // dynamic import retries when the component actually renders.
+    void loadMarkdownPreview().catch(() => {});
 
     try {
       const body = new FormData();
@@ -257,9 +280,7 @@ export function FileConverter() {
           </div>
 
           <div className="rounded-body border border-carbon-warm bg-paper-white p-5">
-            <article className="markdown-body">
-              <Markdown remarkPlugins={[remarkGfm]}>{status.markdown}</Markdown>
-            </article>
+            <MarkdownPreview markdown={status.markdown} />
           </div>
         </div>
       )}
