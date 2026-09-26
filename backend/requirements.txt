@@ -1,0 +1,14 @@
+# Pinned to the extras the product actually offers. Do NOT switch to
+# markitdown[all] — it drags in azure-ai-documentintelligence, azure-identity,
+# speechrecognition, pydub, xlrd and youtube-transcript-api, which pushes the
+# function bundle toward the 500 MB limit for formats this site does not expose.
+#
+# Base markitdown already brings beautifulsoup4, charset-normalizer, defusedxml,
+# magika, markdownify and requests. defusedxml is what makes XML/HTML parsing
+# safe against entity-expansion attacks — do not remove it.
+markitdown[pdf,docx,pptx,xlsx]==0.1.8
+
+# FastAPI's multipart form parsing needs python-multipart installed explicitly;
+# without it the file upload endpoint fails at request-parsing time.
+fastapi==0.141.1
+python-multipart==0.0.32
