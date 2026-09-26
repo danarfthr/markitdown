@@ -1,0 +1,13 @@
+# Python (backend)
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Node (frontend has its own .gitignore; this covers the repo root)
+node_modules/
+
+# Vercel
+.vercel
+
+# macOS
+.DS_Store
