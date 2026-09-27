@@ -11,3 +11,9 @@ node_modules/
 
 # macOS
 .DS_Store
+
+# Local design docs (not tracked)
+/DESIGN.md
+
+# Local agent skills (not tracked)
+.agents/
