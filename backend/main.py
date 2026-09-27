@@ -9,16 +9,26 @@ stripping the prefix.
 from __future__ import annotations
 
 import io
+import json
 import os
+import re
 import time
+import zipfile
 from collections import defaultdict, deque
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
-# UnsupportedFormatException is re-exported from the package root (see
-# markitdown/__init__.py __all__); importing it from markitdown._exceptions
-# would reach into a private module.
-from markitdown import MarkItDown, StreamInfo, UnsupportedFormatException
+# These are re-exported from the package root (see markitdown/__init__.py
+# __all__); importing them from markitdown._exceptions would reach into a
+# private module.
+from markitdown import (
+    FileConversionException,
+    MarkItDown,
+    MissingDependencyException,
+    StreamInfo,
+    UnsupportedFormatException,
+)
+from markitdown.converters import ZipConverter
 
 # ---------------------------------------------------------------------------
 # Limits
@@ -57,6 +67,192 @@ BLOCKED_EXTENSIONS = frozenset(
     }
 )
 
+# Extensions MarkItDown routes to a converter whose optional dependency this
+# deployment deliberately does not install. They are rejected with an honest
+# 415 instead of being accepted and then failing with a misleading
+# "corrupt or password-protected" 422.
+#
+#   .xls  needs the `xls` extra (xlrd). requirements.txt installs
+#         [pdf,docx,pptx,xlsx] only — see the comment there.
+#   .doc  legacy binary Word has no converter at all in MarkItDown.
+#   .rtf  .odt  .svg  fall through to PlainTextConverter, which returns the
+#         raw markup as "Markdown" — worse than an explicit refusal.
+UNSUPPORTED_EXTENSIONS = frozenset({".xls", ".doc", ".rtf", ".odt", ".svg"})
+
+# OOXML and EPUB files are ZIP containers, so they cannot be told apart from a
+# plain archive by magic bytes. Instead the ZIP *member list* is inspected for
+# the marker each format must contain. A renamed archive has none of these and
+# is rejected, while a real document passes through untouched.
+#
+# This matters because MarkItDown registers a ZipConverter that recursively
+# expands archives, and _get_stream_info_guesses() emits a SECOND `.zip` guess
+# whenever magika disagrees with the declared extension — so an extension-only
+# guard does not actually stop a renamed archive from being expanded.
+_ZIP_CONTAINER_MARKERS: dict[str, tuple[str, ...]] = {
+    ".docx": ("word/",),
+    ".pptx": ("ppt/",),
+    ".xlsx": ("xl/",),
+    ".epub": ("META-INF/container.xml",),
+}
+
+# Converted Markdown is plain text with no image store behind it, so image
+# references to local paths are always dead. Remote URLs still resolve, so they
+# are left alone.
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_UNDERLINE_RE = re.compile(r"</?u(?:\s[^>]*)?>", re.I)
+_SLIDE_COMMENT_RE = re.compile(r"<!--\s*Slide number:\s*(\d+)\s*-->")
+
+# Formats whose converters build their output out of HTML, so a tag in the
+# result is the converter's formatting rather than the user's text. Only these
+# get the HTML rewrites below.
+#
+# Everything else is passed through nearly verbatim, so a `<u>` or `<!--` in a
+# .md, .txt, .csv or .ipynb is the user's own data and rewriting it would
+# corrupt the document. (The .ipynb converter in particular copies markdown
+# cells through untouched, and the .csv/.xlsx cell writers round-trip text
+# through HTML, which un-escapes any angle brackets a cell contained.)
+_HTML_DERIVED_EXTENSIONS = frozenset(
+    {".docx", ".pptx", ".xlsx", ".html", ".htm", ".epub"}
+)
+
+
+def _is_resolvable_url(src: str) -> bool:
+    if src.startswith(("http://", "https://")):
+        return True
+    # MarkItDown truncates an oversized data URI to `data:image/png;base64...`
+    # (see convert_img in its _markdownify.py), which is not a usable image. A
+    # complete data URI always carries a comma before its payload.
+    if src.startswith("data:"):
+        return "," in src
+    return False
+
+
+def _is_zip_container(data: bytes) -> bool:
+    """True if the bytes are readable as a ZIP archive."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            return bool(archive.namelist())
+    except Exception:
+        return False
+
+
+def _has_expected_marker(data: bytes, extension: str) -> bool:
+    """True if `data` is a ZIP containing the marker `extension` requires."""
+    markers = _ZIP_CONTAINER_MARKERS[extension]
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = archive.namelist()
+    except Exception:
+        return False
+
+    for marker in markers:
+        if marker.endswith("/"):
+            if any(name.startswith(marker) for name in names):
+                return True
+        elif marker in names:
+            return True
+    return False
+
+
+def _format_passthrough_markdown(markdown: str, extension: str) -> str:
+    """Make raw JSON/XML legible.
+
+    MarkItDown's PlainTextConverter returns JSON and XML verbatim, which
+    collapses to a single unreadable line once rendered. Fencing it as code
+    keeps the content byte-identical while making it display properly.
+    """
+    if extension == ".json":
+        try:
+            parsed = json.loads(markdown)
+        except (ValueError, TypeError):
+            # Not valid JSON; fence whatever came back rather than fail.
+            pass
+        else:
+            markdown = json.dumps(parsed, indent=2, ensure_ascii=False)
+    elif extension not in (".jsonl", ".xml"):
+        return markdown
+
+    # .jsonl is one object per line, so pretty-printing would merge records.
+
+    if markdown.lstrip().startswith("```"):
+        return markdown
+    # Four-backtick fence: JSON/XML content can itself contain ``` runs.
+    return f"````\n{markdown.strip()}\n````"
+
+
+def _clean_markdown(markdown: str, extension: str) -> str:
+    """Tidy converter output for human-readable rendering.
+
+    MarkItDown targets LLM pipelines, so a few things it emits on purpose are
+    wrong for a document preview:
+
+    - The PPTX converter writes `<!-- Slide number: N -->` before every slide,
+      and the DOCX and HTML converters map underline to a literal `<u>` tag.
+      The preview renders Markdown without `rehype-raw` (deliberately, for
+      XSS), so raw HTML is escaped and shown to the user as visible text.
+    - Embedded images become `![alt](Picture1.jpg)`, but the response carries no
+      image data, so those links are always broken.
+    - JSON and XML come back as raw text.
+
+    The HTML rewrites are confined to `_HTML_DERIVED_EXTENSIONS`; see the note
+    there for why rewriting every format would be data loss.
+    """
+    if extension in _HTML_DERIVED_EXTENSIONS:
+        if extension == ".pptx":
+            markdown = _SLIDE_COMMENT_RE.sub(
+                lambda m: f"\n\n## Slide {m.group(1)}\n", markdown
+            )
+        # Any remaining comment is converter bookkeeping the reader does not
+        # need.
+        markdown = _HTML_COMMENT_RE.sub("", markdown)
+
+        # A real Word underline and the literal text "<u>x</u>" both arrive as
+        # `<u>x</u>`, and are indistinguishable here, so underline is dropped
+        # rather than guessed at. DESIGN.md has no underline in its type system.
+        markdown = _UNDERLINE_RE.sub("", markdown)
+
+    markdown = _replace_dead_images(markdown)
+    markdown = _format_passthrough_markdown(markdown, extension)
+
+    return _collapse_blank_runs(markdown)
+
+
+def _replace_dead_images(markdown: str) -> str:
+    """Turn image links that cannot resolve into visible alt text.
+
+    Keep the alt text so no information is lost, drop the dead link.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        alt, src = match.group(1).strip(), match.group(2)
+        if _is_resolvable_url(src):
+            return match.group(0)
+        return f"[image: {alt}]" if alt else "[image]"
+
+    return _IMAGE_RE.sub(_replace, markdown)
+
+
+def _collapse_blank_runs(markdown: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", markdown).strip()
+
+
+def _caused_by_missing_dependency(exc: FileConversionException) -> bool:
+    """True if the failure was a converter missing an optional dependency.
+
+    MarkItDown still matches a converter by extension when that converter's
+    extra was never installed, then fails inside convert(). That is a
+    deployment gap, not a malformed upload, so it must not be reported as
+    "corrupt or password-protected".
+    """
+    attempts = [a for a in (getattr(exc, "attempts", None) or []) if a.exc_info]
+    return bool(attempts) and all(
+        isinstance(attempt.exc_info[1], MissingDependencyException)
+        for attempt in attempts
+    )
+
+
 # ---------------------------------------------------------------------------
 # Converter singleton
 # ---------------------------------------------------------------------------
@@ -68,6 +264,26 @@ BLOCKED_EXTENSIONS = frozenset(
 # enable_plugins is left at its default (False): this endpoint parses untrusted
 # uploads, and plugins are arbitrary third-party code.
 _converter = MarkItDown()
+
+# The ZipConverter recursively expands archives, including nested ones, which on
+# a public endpoint is a zip-bomb / CPU-exhaustion vector. Removing it makes the
+# guard defence-in-depth rather than the only line of defence: even if a request
+# slips past the extension and marker checks, nothing will expand an archive.
+#
+# MarkItDown offers no public way to unregister a converter, so this reaches
+# into `_converters`. A silent no-op would leave the endpoint exposed while
+# looking guarded, so the removal is verified rather than assumed.
+_converters_before = len(_converter._converters)
+_converter._converters = [
+    registration
+    for registration in _converter._converters
+    if not isinstance(registration.converter, ZipConverter)
+]
+if len(_converter._converters) != _converters_before - 1:
+    raise RuntimeError(
+        "Failed to remove MarkItDown's ZipConverter. Its internals changed; "
+        "re-check that archives are not expanded before deploying."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +351,12 @@ async def convert(request: Request, file: UploadFile = File(...)) -> PlainTextRe
             detail="Archive files are not supported. Upload the document inside it instead.",
         )
 
+    if extension in UNSUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"{extension} files are not supported. Try saving it as PDF, DOCX or XLSX first.",
+        )
+
     data = await file.read()
 
     if len(data) == 0:
@@ -148,6 +370,19 @@ async def convert(request: Request, file: UploadFile = File(...)) -> PlainTextRe
                 f"The limit is {MAX_FILE_BYTES // (1024 * 1024)} MB."
             ),
         )
+
+    # A .docx/.pptx/.xlsx/.epub is a ZIP container, so the declared extension
+    # alone proves nothing: a renamed archive would otherwise be expanded by
+    # the converter chain. Require the marker the format actually needs.
+    if extension in _ZIP_CONTAINER_MARKERS:
+        if not _is_zip_container(data) or not _has_expected_marker(data, extension):
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    f"That file is not a valid {extension.lstrip('.').upper()} document. "
+                    "If it is an archive, upload the document inside it instead."
+                ),
+            )
 
     try:
         # StreamInfo carries the original filename and extension through the
@@ -163,16 +398,28 @@ async def convert(request: Request, file: UploadFile = File(...)) -> PlainTextRe
             status_code=415,
             detail="That file type is not supported.",
         ) from None
-    except Exception:
+    except FileConversionException as exc:
         # Converters raise a wide variety of library-specific errors on
-        # malformed input. None of them should surface a stack trace to the
-        # client, and all of them mean the same thing to the user.
+        # malformed input. A missing optional dependency is not a bad file,
+        # though, and reporting it as one would be actively misleading.
+        if _caused_by_missing_dependency(exc):
+            raise HTTPException(
+                status_code=415,
+                detail="That file type is not supported.",
+            ) from None
+        raise HTTPException(
+            status_code=422,
+            detail="That file could not be converted. It may be corrupt or password-protected.",
+        ) from None
+    except Exception:
         raise HTTPException(
             status_code=422,
             detail="That file could not be converted. It may be corrupt or password-protected.",
         ) from None
 
-    return PlainTextResponse(result.markdown, media_type="text/markdown")
+    markdown = _clean_markdown(result.markdown, extension)
+
+    return PlainTextResponse(markdown, media_type="text/markdown")
 
 
 @app.get("/api/health")

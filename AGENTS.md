@@ -65,33 +65,90 @@ once to generate those types first. Never "fix" this by hand-writing a props typ
 - Install `markitdown[pdf,docx,pptx,xlsx]`. **Do not pull `[all]`** — it drags in
   `azure-ai-documentintelligence`, `azure-identity`, `speechrecognition`, `pydub`, `xlrd`
   and `youtube-transcript-api`, none of which this site exposes.
+- **`xls` is deliberately not installed, and `.xls` is refused up front.** Without the
+  extra, `xlrd` is absent but `XlsConverter.accepts()` still matches `.xls`, so the request
+  fails inside `convert()` with a missing-dependency error that reads like a corrupt file.
+  `UNSUPPORTED_EXTENSIONS` in `main.py` rejects it with an honest 415 instead. Adding the
+  extra means removing it from that set.
 - **Construct `MarkItDown()` once at module scope.** Its `__init__` loads the magika ONNX
-  model (~24 MB of onnxruntime); per-request construction would wreck cold start.
+  model (~24 MB of onnxruntime); per-request construction would wreck cold start. The same
+  module-scope block also strips the `ZipConverter` out of the instance — see "Archive
+  handling" below for why.
 - Pass `StreamInfo(extension=..., filename=...)` to `convert()`. Without it MarkItDown sees
   only an anonymous byte stream and format detection is far less reliable — an `.xlsx`
-  with no name is just a ZIP.
+  with no name is just a ZIP. Note that this makes the declared extension *a* guess rather
+  than *the* guess: magika can add a second one, which is why the archive guard cannot rely
+  on the extension alone.
 - Leave `enable_plugins` at its default `False`; never pass `--use-plugins`. This parses
   untrusted uploads and plugins are arbitrary third-party code.
 - `defusedxml` is a base dependency and is what makes XML/HTML parsing safe. Do not remove.
 - **Error types differ by cause.** `UnsupportedFormatException` is *not* what most failures
   raise — a bad archive raises `FileConversionException`. Catch broadly and map to a 4xx;
   an uncaught converter error becomes an opaque 500.
-- **MarkItDown falls back to plain text.** A corrupt `.pdf` or a `.png` of junk does not
-  error; it returns the raw bytes (or an empty string) as Markdown with a 200. The
-  frontend treats empty output as a failure, so this is handled, but do not assume a 200
-  means the conversion was meaningful.
+- **A missing optional dependency is not a bad file.** MarkItDown still matches a converter
+  by extension even when that converter's extra was never installed, then fails inside
+  `convert()`. `main.py` inspects `FileConversionException.attempts` and answers 415 for
+  that case rather than the 422 used for genuinely malformed input.
+- **MarkItDown falls back to plain text.** A `.rtf`, `.svg` or unrecognised extension does
+  not error; `PlainTextConverter` returns the raw bytes as Markdown with a 200. Images are
+  the opposite — the converter succeeds and returns an empty string. The frontend treats
+  empty output as a failure, so this is handled, but do not assume a 200 means the
+  conversion was meaningful. A *corrupt* PDF does raise (`PDFSyntaxError` →
+  `FileConversionException` → 422); only images come back empty.
 - `magika` is pinned `~=0.6.1` by markitdown. Do not force it to 1.x.
+
+### Output post-processing in `main.py`
+
+MarkItDown targets LLM pipelines, so some of what it emits is wrong for a rendered
+preview. `_clean_markdown()` handles three cases, and the scoping matters:
+
+- The PPTX converter writes `<!-- Slide number: N -->` before every slide and the DOCX and
+  HTML converters map underline to a literal `<u>` tag. The preview renders Markdown
+  **without** `rehype-raw` (deliberately — see Security), so raw HTML would be escaped and
+  shown to the user as visible text. Both are rewritten away.
+- Embedded images become `![alt](Picture1.jpg)` with no image data behind them, and DOCX
+  images become a truncated `data:image/png;base64...` URI. Both are replaced with their
+  alt text.
+- JSON and XML come back as raw text on one line, so they are fenced as code. JSON is
+  pretty-printed first; `.jsonl` is left alone because pretty-printing would merge its
+  records.
+
+**The HTML rewrites are scoped to `_HTML_DERIVED_EXTENSIONS` on purpose.** Every other
+format is passed through close to verbatim, so a `<u>` typed into a `.csv` cell or a
+`<!-- -->` in a `.md` file is the *user's own data* — rewriting it corrupts the document.
+The `.csv` and `.xlsx` writers round-trip cell text through HTML, which un-escapes angle
+brackets, so a cell containing `<u>literal</u>` really does arrive as a live-looking tag.
+Do not widen this set without checking that the format's converter cannot emit literal
+user text.
+
+A real Word underline and the typed text `<u>x</u>` are byte-identical by the time
+post-processing runs, so underline is dropped rather than guessed at. DESIGN.md has no
+underline in its type system, so this is not a loss.
 
 ## Archive handling — read before touching the ZIP guard
 
-`.docx`, `.pptx` and `.xlsx` are ZIP containers and begin with `PK\x03\x04`. Archives are
-therefore rejected by **declared extension** (`BLOCKED_EXTENSIONS` in `backend/main.py`),
-deliberately **not** by magic bytes. Sniffing for the ZIP header would reject the entire
-core feature set — this was verified against real files, not assumed.
+`.docx`, `.pptx`, `.xlsx` and `.epub` are ZIP containers and begin with `PK\x03\x04`, so
+they cannot be separated from a plain archive by magic bytes. Two layers guard this:
 
-MarkItDown ships a `ZipConverter` that recursively expands archives, which is a zip-bomb
-and CPU-exhaustion vector on a public endpoint. If you change this guard, re-test a real
-`.docx` and `.xlsx` end-to-end.
+1. **Declared extension** — `BLOCKED_EXTENSIONS` in `backend/main.py` rejects archives by
+   extension, deliberately not by magic bytes, since sniffing for the ZIP header would
+   reject the entire core feature set.
+2. **ZIP member list** — for the four container formats above, the archive is opened and
+   its member list must contain the marker the format requires (`word/`, `ppt/`, `xl/`,
+   `META-INF/container.xml`). A renamed archive has none of them.
+
+**The extension check alone is NOT sufficient, and assuming it was is a real bug.** The
+ZipConverter matches on `application/zip`, and `_get_stream_info_guesses()` emits a
+*second* `.zip` guess whenever magika's detection disagrees with the declared extension —
+`_convert()` then tries every guess against every converter. A ZIP named `report.docx`
+was expanded recursively, nested archives included, despite the guard. This was verified
+by execution, not assumed.
+
+The third layer is that `main.py` **removes the ZipConverter from the instance entirely**,
+so no archive is expanded even if a request gets past both checks.
+
+If you change any of this, re-test a real `.docx`, `.xlsx` and `.pptx` end-to-end *and* a
+renamed archive that must still be rejected.
 
 ## Limits
 

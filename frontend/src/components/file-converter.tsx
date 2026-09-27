@@ -116,7 +116,8 @@ export function FileConverter() {
       if (markdown.trim().length === 0) {
         setStatus({
           kind: "error",
-          message: "That file converted to nothing — it may be empty or image-only.",
+          message:
+            "That file converted to nothing. A scanned or image-only document has no text layer to extract, so there is nothing to convert.",
         });
         return;
       }
@@ -207,7 +208,7 @@ export function FileConverter() {
             {isConverting ? "Converting…" : "Drop a file, or choose one"}
           </p>
           <p className="max-w-md text-body-sm text-carbon-warm">
-            PDF, Word, PowerPoint, Excel, HTML, CSV, JSON, XML, images and more.
+            PDF, Word, PowerPoint, Excel, HTML, CSV, JSON, XML and plain text.
             Up to {formatBytes(MAX_FILE_BYTES)}.
           </p>
 
@@ -279,7 +280,7 @@ export function FileConverter() {
             </div>
           </div>
 
-          <div className="rounded-body border border-carbon-warm bg-paper-white p-5">
+          <div className="overflow-x-auto rounded-body border border-carbon-warm bg-paper-white p-5">
             <MarkdownPreview markdown={status.markdown} />
           </div>
         </div>

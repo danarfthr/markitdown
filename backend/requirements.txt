@@ -3,6 +3,13 @@
 # speechrecognition, pydub, xlrd and youtube-transcript-api, which pushes the
 # function bundle toward the 500 MB limit for formats this site does not expose.
 #
+# The `xls` extra is deliberately NOT installed. Legacy .xls needs xlrd, and
+# without it XlsConverter.accepts() still matches .xls and then fails at
+# convert() time with a missing-dependency error — which the endpoint would have
+# to report as a broken file. Instead .xls is refused up front in main.py
+# (UNSUPPORTED_EXTENSIONS) with a message telling the user to re-save as XLSX.
+# Adding `xls` here means also removing it from that set.
+#
 # Base markitdown already brings beautifulsoup4, charset-normalizer, defusedxml,
 # magika, markdownify and requests. defusedxml is what makes XML/HTML parsing
 # safe against entity-expansion attacks — do not remove it.

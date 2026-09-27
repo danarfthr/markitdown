@@ -5,11 +5,11 @@ import { SiteNav } from "@/components/site-nav";
 const FORMATS = [
   {
     title: "Documents",
-    body: "PDF, Word, PowerPoint and Excel, converted through Microsoft's MarkItDown.",
+    body: "Word, PowerPoint and Excel keep their headings, lists and tables. PDF is text-layer extraction only, so scanned pages come back empty and layout is not reconstructed.",
   },
   {
     title: "Structured data",
-    body: "HTML, CSV, JSON, XML and RSS become clean Markdown tables and lists.",
+    body: "HTML and CSV become Markdown tables and headings. JSON and XML come back as fenced code, since they have no natural Markdown shape.",
   },
   {
     title: "Nothing is stored",
@@ -30,13 +30,13 @@ export default function Home() {
          * honest reading of the system rather than a decorative stand-in.
          */}
         <header className="mx-auto w-full max-w-page px-6 pt-24 pb-12">
-          <SectionLabel>Any file to Markdown</SectionLabel>
+          <SectionLabel>Documents to Markdown</SectionLabel>
           <h1 className="mt-6 max-w-3xl text-display text-carbon-warm">
             Convert a file the way a specification sheet reads.
           </h1>
           <p className="mt-6 max-w-xl text-body text-carbon-warm">
             Drop in a PDF, a Word document, a spreadsheet or a plain text file.
-            You get clean Markdown back, ready to copy or download.
+            You get Markdown back, ready to copy or download.
           </p>
         </header>
 

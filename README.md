@@ -6,6 +6,10 @@ One-page web app that converts a file to Markdown using
 Drop in a PDF, Word document, PowerPoint, Excel workbook, HTML, CSV, JSON or XML
 file and get Markdown back, rendered in the page and ready to copy or download.
 
+See "Output quality" under Limits for what each format actually produces —
+MarkItDown is designed for LLM pipelines, so PDF in particular is text
+extraction only.
+
 ## Stack
 
 | Part | Technology |
@@ -84,14 +88,40 @@ real conversion through the running stack.
   bypassable.
 - **Archives are rejected** (`.zip`, `.tar`, `.gz`, `.7z`, and similar).
   MarkItDown ships a ZIP converter that recursively expands archives, which is a
-  zip-bomb and CPU-exhaustion vector on a public endpoint.
+  zip-bomb and CPU-exhaustion vector on a public endpoint. That converter is
+  also removed from the instance in `backend/main.py`, so nothing expands an
+  archive even if a request gets past the guard.
 - **Rate limit:** 20 conversions per minute per IP. This is best-effort,
   in-process state — see the caveat in `backend/main.py`.
 
-Note that `.docx`, `.pptx` and `.xlsx` are themselves ZIP containers and begin
-with the bytes `PK\x03\x04`. They are allowed through. Archives are rejected by
-declared extension, deliberately **not** by magic bytes, because sniffing for
-the ZIP header would reject the core feature set.
+`.docx`, `.pptx`, `.xlsx` and `.epub` are themselves ZIP containers and begin
+with the bytes `PK\x03\x04`. They are allowed through, but not on the strength
+of their extension alone: the ZIP member list is checked for the marker the
+format requires (`word/`, `ppt/`, `xl/`, `META-INF/container.xml`). A renamed
+archive has none of those and is rejected.
+
+### Output quality
+
+MarkItDown is built for LLM pipelines, not for high-fidelity human-readable
+conversion, and its own README says so. What that means here:
+
+- **PDF is text extraction only.** No headings, lists or bold are reconstructed,
+  and a scanned or image-only PDF yields nothing. There is no OCR, because that
+  needs the `markitdown-ocr` plugin and enabling plugins on untrusted uploads is
+  not acceptable.
+- **JSON and XML have no Markdown equivalent**, so they are returned as fenced
+  code rather than being silently mangled into prose.
+- **Images are not supported.** The image converter needs `exiftool` plus an LLM
+  client to produce anything, neither of which this deployment has.
+- `.xls`, `.doc`, `.rtf`, `.odt` and `.svg` are refused up front with a 415.
+  `.xls` would need the `xls` extra; the others have no converter and would fall
+  through to plain-text passthrough.
+
+`backend/main.py` post-processes converter output to remove the HTML that
+MarkItDown emits on purpose (PPTX slide comments, DOCX `<u>` underline tags) and
+to replace image links that cannot resolve. Those rewrites are scoped to
+HTML-derived formats only, so a `<u>` in a `.csv` or a `<!-- -->` in a `.md` —
+which is the user's own text — is left untouched.
 
 ## Deploying
 
